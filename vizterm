@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+#
+# http://github.com/danyq/vizterm
+#
+# Runs a file server and a websocket server.
+# Launches a subprocess running the given command
+# for each client that connects, and sends the
+# output over the websocket.
+#
+# usage:
+# vizterm <command> <args> ...
+# vizterm -p <port> <command> <args> ...
+
+import sys
+import os
+import os.path
+import threading
+import time
+import subprocess
+import signal
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from websocket_server import WebsocketServer
+
+HOST = 'localhost'  # local connections only
+
+if sys.argv[1] == '-p':
+    UI_PORT = int(sys.argv[2])
+    COMMAND = sys.argv[3:]
+else:
+    UI_PORT = 8080
+    COMMAND = sys.argv[1:]
+
+WS_PORT = UI_PORT + 1
+HTML_DIR = os.path.dirname(os.path.realpath(__file__))
+
+MAX_LINE_BYTES = 10*1000*1000
+
+
+#################### process management
+
+procs = {}  # client id => subprocess
+def run(client):
+    send(client, '[server] running: %s\n' % ' '.join(COMMAND))
+    assert client['id'] not in procs
+
+    cmd_env = os.environ.copy()
+    cmd_env['PYTHONUNBUFFERED'] = '1'
+    cmd_env['VIZTERM'] = '1'
+    # setsid creates a new process group so that killpg will
+    # kill any grandchildren as well
+    try:
+        proc = subprocess.Popen(COMMAND,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT,
+                                bufsize=1,
+                                env=cmd_env,
+                                preexec_fn=os.setsid)
+    except OSError:
+        send(client, sys.exc_info()[1])
+        proc = None
+    procs[client['id']] = proc
+    while True:
+        line = proc.stdout.readline(MAX_LINE_BYTES).decode()
+        if not line: break
+        if len(line) >= MAX_LINE_BYTES:
+            line = '[server] error, line too long (10 MB)\n'
+        if not send(client, line): break
+        rate_limit(len(line))
+    while proc.poll() is None:
+        time.sleep(0.1)
+    if proc.returncode == 0:
+        send(client, '[server] exit success\n')
+    else:
+        send(client, '[server] exit error, return code %i\n' % proc.returncode)
+    if client['id'] in procs:
+        del procs[client['id']]
+
+def kill(client_id):
+    if client_id not in procs: return
+    proc = procs[client_id]
+    if proc and proc.poll() is None:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+    del procs[client_id]
+
+def sigint(signal, frame):
+    for client_id in procs:
+        kill(client_id)
+        print('killed process', client_id)
+        return  # kill one at a time
+    sys.exit()
+
+# if 0.25 seconds-worth of data arrives in
+# less than 0.25s, sleep for 0.25s
+RL_LINES_PER_SEC = 200
+RL_BYTES_PER_SEC = 100000
+RL_PERIOD = 0.25
+rl_count = 0
+rl_start = time.time()
+def rate_limit(num_bytes):
+    global rl_count, rl_start
+    rl_count += 1.0 / RL_LINES_PER_SEC + num_bytes / RL_BYTES_PER_SEC
+    while rl_count >= RL_PERIOD:
+        if time.time() - rl_start < RL_PERIOD:
+            time.sleep(RL_PERIOD)
+        rl_count -= RL_PERIOD
+        rl_start = time.time()
+
+
+################### websocket server
+
+def send(client, *args):
+    msg = ' '.join(map(str, args))
+    try:
+        ws_server.send_message(client, msg)
+    except BrokenPipeError:
+        print('broken pipe')
+        return False
+    return True
+
+def new_client(client, server):
+    print("Client(%d) connected" % client['id'])
+    t = threading.Thread(target=run, args=[client])
+    t.daemon = True
+    t.start()
+
+def client_left(client, server):
+    print("Client(%d) disconnected" % client['id'])
+    kill(client['id'])
+
+def message_received(client, server, message):
+    if len(message) > 200:
+        message = message[:200]+'..'
+    print("Client(%d) said: %s" % (client['id'], message))
+
+
+################### file server
+
+class FileServer(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/':
+            self.send_file('index.html', 'text/html')
+        else:
+            self.send_404()
+
+    def send_file(self, filename, content_type):
+        with open(os.path.join(HTML_DIR, filename), 'rb') as f:
+            content = f.read()
+        if filename == 'index.html':
+            content = content.replace(b'%port%', str(WS_PORT).encode())
+        self.send_response(200)
+        self.send_header('Content-type', content_type)
+        self.end_headers()
+        try:
+            self.wfile.write(content)
+        except BrokenPipeError:
+            print('broken pipe %s' % filename)
+
+    def send_404(self):
+        self.send_response(404)
+        self.send_header('Content-type', 'text/html')
+        self.end_headers()
+        self.wfile.write(('not found: ' + repr(self.path)).encode())
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGINT, sigint)
+
+    ui_server = HTTPServer((HOST, UI_PORT), FileServer)
+    ui_thread = threading.Thread(target = ui_server.serve_forever)
+    ui_thread.daemon = True
+    ui_thread.start()
+
+    ws_server = WebsocketServer(WS_PORT, host=HOST)
+    ws_server.set_fn_new_client(new_client)
+    ws_server.set_fn_client_left(client_left)
+    ws_server.set_fn_message_received(message_received)
+
+    print('http://%s:%i/' % (HOST, UI_PORT))
+    print('websocket port %i' % WS_PORT)
+
+    ws_server.run_forever()

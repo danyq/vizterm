@@ -1,0 +1,132 @@
+<!doctype html>
+<html>
+<head>
+  <title>vizterm</title>
+  <style>
+  body {
+    margin-bottom: 50px;
+  }
+  .str {
+    display: inline;
+    font-family: monospace;
+    white-space: pre;
+  }
+  .block {
+    display: inline-block;
+    font-family: monospace;
+    white-space: pre;
+    vertical-align: text-top;
+  }
+  .server {
+    color: #080;
+  }
+  .client {
+    color: #00f;
+  }
+  .error {
+    color: #f00;
+  }
+  </style>
+
+<script type="text/javascript">
+"use strict";
+
+function newElt(parent, type, attr) {
+  var elt = document.createElement(type);
+  for (var key in attr) {
+    if (attr.hasOwnProperty(key))
+      elt[key] = attr[key];
+  }
+  if (parent) parent.appendChild(elt);
+  return elt;
+}
+
+var ws = new WebSocket('ws://localhost:%port%/');
+ws.onopen = function() { output('[client] connected\n'); };
+ws.onmessage = function(e) { output(e.data); };
+ws.onclose = function() { output('[client] disconnected\n'); };
+ws.onerror = function(e) { output('[client] websocket error\n'); console.log(e); };
+
+function output(str) {
+  var scrollAtBottom = (window.innerHeight + window.scrollY) >= document.body.offsetHeight;
+
+  var success = false;
+  if (str.startsWith('json ')) {
+    var json_str = str.slice('json '.length)
+    try {
+      var obj = JSON.parse(json_str);
+    } catch (e) {
+      var obj = null;
+    }
+    newObj(obj);
+    success = true;
+  }
+  if (!success)
+    outputStr(str);
+
+  if (scrollAtBottom) {
+    // scroll to bottom once new elements are rendered
+    setTimeout(function() {
+      window.scrollTo(0, document.body.scrollHeight);
+    }, 0);
+  }
+}
+
+function outputHTML(str) {
+  document.body.innerHTML += str;
+  return document.body.lastChild;
+}
+
+function outputStr(str) {
+  var elt = newElt(document.body, 'div', {className:'str', innerText:str});
+  if (str.startsWith('[server]')) {
+    if (str.includes('error'))
+      elt.classList.add('error');
+    else
+      elt.classList.add('server');
+  }
+  if (str.startsWith('[client]'))
+    elt.classList.add('client');
+  return elt;
+}
+
+function outputBlock(str) {
+  var elt = newElt(document.body, 'div', {className:'block', innerText:str});
+  return elt;
+}
+
+function newObj(obj) {
+  if (!('type' in obj))
+    return outputStr(String(obj));
+
+  var elt;
+  if (obj.type == 'html')
+    elt = outputHTML(obj.data);
+  else if (obj.type == 'str')
+    elt = outputStr(obj.data);
+  else if (obj.type == 'block')
+    elt = outputBlock(obj.data);
+  else if (obj.type == 'clear') {
+    document.body.innerHTML = '';
+    return;
+  } else
+    return outputStr(String(obj));
+
+  var prev = document.getElementById(obj.id);
+  if (obj.id) elt.id = obj.id;
+  if (obj.style) elt.style.cssText = obj.style;
+  if (prev) document.body.replaceChild(elt, prev);
+}
+
+// close connection on Ctrl-C
+window.addEventListener('keydown', function(e) {
+  if (e.key == 'c' && e.ctrlKey)
+    ws.close();
+});
+
+</script>
+
+</head>
+<body>
+</body>
+</html>
